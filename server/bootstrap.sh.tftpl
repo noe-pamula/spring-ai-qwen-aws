@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec > >(tee -a /var/log/spring-ai-bootstrap.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+export AWS_DEFAULT_REGION='${region}'
+export MODEL='${model}'
+export DOMAIN='${domain}'
+export SECRET_ARN='${secret_arn}'
+export LITELLM_IMAGE='${litellm_image}'
+MARKER=/opt/spring-ai/READY
+mkdir -p /opt/spring-ai
+chmod 700 /opt/spring-ai
+apt-get update
+apt-get install -y curl ca-certificates openssl docker.io awscli python3
+systemctl enable --now docker
+# Docker Compose standalone pinned binary; suitable for x86_64 GPU instance
+curl -fLsS --retry 5 -o /usr/local/bin/docker-compose https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64
+chmod 755 /usr/local/bin/docker-compose
+# Base GPU AMI ships with NVIDIA drivers; verify before downloading model
+nvidia-smi
+curl -fsSL https://ollama.com/install.sh | sh
+mkdir -p /etc/systemd/system/ollama.service.d
+printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:11434"\nEnvironment="OLLAMA_NUM_PARALLEL=2"\nEnvironment="OLLAMA_CONTEXT_LENGTH=4096"\n' > /etc/systemd/system/ollama.service.d/training.conf
+systemctl daemon-reload
+systemctl enable --now ollama
+for i in $(seq 1 90); do curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 2; done
+ollama pull "$MODEL"
+# Secrets generated ON INSTANCE, not Terraform state or user_data.
+MASTER_KEY="sk-$(openssl rand -hex 32)"
+SALT_KEY="sk-$(openssl rand -hex 32)"
+DB_PASSWORD="$(openssl rand -hex 24)"
+cat > /opt/spring-ai/.env <<ENVV
+LITELLM_MASTER_KEY=$MASTER_KEY
+LITELLM_SALT_KEY=$SALT_KEY
+POSTGRES_PASSWORD=$DB_PASSWORD
+DATABASE_URL=postgresql://litellm:$DB_PASSWORD@db:5432/litellm
+LITELLM_IMAGE=$LITELLM_IMAGE
+ENVV
+chmod 600 /opt/spring-ai/.env
+cat > /opt/spring-ai/litellm.yaml <<'CONF'
+model_list:
+  - model_name: qwen-training
+    litellm_params:
+      model: ollama/qwen3:14b
+      api_base: http://host.docker.internal:11434
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+CONF
+# Substitute model safely for the config (model input controlled by operator)
+python3 - <<'PY'
+import os
+p='/opt/spring-ai/litellm.yaml'
+s=open(p).read().replace('ollama/qwen3:14b','ollama/'+os.environ['MODEL'])
+open(p,'w').write(s)
+PY
+cat > /opt/spring-ai/Caddyfile <<'CONF'
+${domain} {
+  reverse_proxy litellm:4000
+}
+CONF
+cat > /opt/spring-ai/compose.yaml <<'CONF'
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD}
+      POSTGRES_DB: litellm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  litellm:
+    image: $${LITELLM_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./litellm.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "127.0.0.1:4000:4000"
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - litellm
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+CONF
+cd /opt/spring-ai
+docker-compose up -d
+# LiteLLM key creation and test. Poll until ready; never write keys to log.
+for i in $(seq 1 120); do
+  if curl -fsS -H "Authorization: Bearer $MASTER_KEY" http://127.0.0.1:4000/v1/models >/dev/null 2>&1; then break; fi
+  sleep 5
+done
+python3 - <<'PY'
+import json, os, subprocess, time, urllib.request
+master=os.environ.get('MASTER_KEY_FOR_PY')
+# Generated secret read via local .env without printing it
+with open('/opt/spring-ai/.env') as f:
+    for line in f:
+        if line.startswith('LITELLM_MASTER_KEY='):
+            master=line.strip().split('=',1)[1]
+keys={}
+for username in ('stagiaire1','stagiaire2','stagiaire3','formateur'):
+    payload=json.dumps({'models':['qwen-training'],'key_alias':'training-'+username,'metadata':{'participant':username},'rpm_limit':15}).encode()
+    request=urllib.request.Request('http://127.0.0.1:4000/key/generate',data=payload,headers={'Authorization':'Bearer '+master,'Content-Type':'application/json'},method='POST')
+    for attempt in range(12):
+        try:
+            with urllib.request.urlopen(request,timeout=30) as r:
+                key=json.load(r)['key'];keys[username]=key
+            break
+        except Exception:
+            if attempt==11:raise
+            time.sleep(5)
+keys['admin_master_key']=master
+keys['api_url']='https://'+os.environ['DOMAIN']
+keys['model']='qwen-training'
+blob=json.dumps(keys)
+# pipe secret to aws command through temporary 0600 file (never command line)
+from pathlib import Path
+path=Path('/opt/spring-ai/keys.json');path.write_text(blob);path.chmod(0o600)
+subprocess.run(['aws','secretsmanager','put-secret-value','--secret-id',os.environ['SECRET_ARN'],'--secret-string','file://'+str(path),'--region',os.environ['AWS_DEFAULT_REGION']],check=True,stdout=subprocess.DEVNULL)
+path.unlink()
+PY
+# Basic test: local authenticated proxy endpoint and model loaded
+curl -fsS -H "Authorization: Bearer $MASTER_KEY" http://127.0.0.1:4000/v1/models >/dev/null
+touch "$MARKER"
+echo "READY - API domain: $DOMAIN. DNS and HTTPS certificate may require more time."

@@ -1,0 +1,7 @@
+domain = "llm.example.com"
+# Optional: if the domain is in a Route53 public hosted zone, automate DNS:
+# route53_zone_id = "Z0123456789ABC"
+# Optional alternative subnet / model / instance type:
+# subnet_id = "subnet-0123456789abcdef0"
+# model = "qwen3:14b"
+# instance_type = "g6.2xlarge"

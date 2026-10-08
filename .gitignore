@@ -1,0 +1,17 @@
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/.terraform.tfstate.lock.info
+**/terraform.tfvars
+**/*.auto.tfvars
+**/*.tfvars.json
+**/*.auto.tfvars.json
+**/*.tfplan
+*.pem
+*.key
+*.p12
+keys*.json
+.env
+.env.*
+crash.log
+crash.*.log
